@@ -97,12 +97,37 @@ public class LongAdder extends Striped64 implements Serializable {
      * @param x the value to add
      */
     public void add(long x) {
+        //as 表示cells引用
+        //b 表示获取的base值
+        //v 表示期望值
+        //m 表cells数组的长度
+        //a 表示当前线程命中的cell单元格
         Cell[] as; long b, v; int m; Cell a;
+        //条件一：true -> 表示cells已经初始化过了 当前线程应该将数据写入到对应的cell中
+        //       false -> 表示cells未初始化 当前所有线程应该将数据写入到base中
+        //条件二： true -> 表示当前线程cas替换成功
+        //        false -> 表示发生竞争 可能需要重试或者扩容
         if ((as = cells) != null || !casBase(b = base, b + x)) {
+            //什么时候会进来
+            //1.true -> 表示cells已经初始化过了 当前线程应该将数据写入到对应的cell中
+            //2.false -> 表示发生竞争 可能需要重试或者扩容
+
+            //true 未竞争 false发生竞争
             boolean uncontended = true;
+            //条件一： true 说明cells未初始化 也就是多线程写base发生竞争
+            //        false 说明cells已经初始化 当前线程应该是找自己的cell 写值
+            //条件二： getProbe()获取当前线程的hash值 m表示cells长度 - 1 cells长度为2的次方数
+            //        true 说明当前线程对应下标的cell为空 需要创建 longAccumulate支持
+            //        false 说明当前线程对应的cel不为空 说明下一步应该将x值添加到cell中
+            //条件三： true 表示cas失败 意味着当前线程对应的cell有竞争
+            //        false 表示cas成功
             if (as == null || (m = as.length - 1) < 0 ||
                 (a = as[getProbe() & m]) == null ||
                 !(uncontended = a.cas(v = a.value, v + x)))
+                //那些情况会调用
+                //1.true -> 说明cells未初始化 也就是多线程写base发生竞争[重试|初始化cells]
+                //2.true -> 说明当前线程对应下标的cell为空 需要创建 longAccumulate支持
+                //3.true -> cas失败 意味着当前线程对应的cell有竞争[重试|扩容]
                 longAccumulate(x, null, uncontended);
         }
     }
