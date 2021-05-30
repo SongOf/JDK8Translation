@@ -2677,12 +2677,42 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
      * Helps transfer if a resize is in progress.
      */
     final Node<K,V>[] helpTransfer(Node<K,V>[] tab, Node<K,V> f) {
+        //nextTab 引用的是 fwd.nextTable == map.nextTable 理论上是这样。
+        //sc 保存map.sizeCtl
         Node<K,V>[] nextTab; int sc;
+
+        //条件一：tab != null 恒成立 true
+        //条件二：(f instanceof ForwardingNode) 恒成立 true
+        //条件三：((ForwardingNode<K,V>)f).nextTable) != null 恒成立 true
         if (tab != null && (f instanceof ForwardingNode) &&
             (nextTab = ((ForwardingNode<K,V>)f).nextTable) != null) {
+            //拿当前标的长度 获取 扩容标识戳   假设 16 -> 32 扩容：1000 0000 0001 1011
             int rs = resizeStamp(tab.length);
+            //条件一：nextTab == nextTable
+            //成立：表示当前扩容正在进行中
+            //不成立：1.nextTable被设置为Null 了，扩容完毕后，会被设为Null
+            //       2.再次出发扩容了...咱们拿到的nextTab 也已经过期了...
+            //条件二：table == tab
+            //成立：说明 扩容正在进行中，还未完成
+            //不成立：说明扩容已经结束了，扩容结束之后，最后退出的线程 会设置 table = nextTable
+
+            //条件三：(sc = sizeCtl) < 0
+            //成立：说明扩容正在进行中
+            //不成立：说明sizeCtl当前是一个大于0的数，此时代表下次扩容的阈值，当前扩容已经结束。
             while (nextTab == nextTable && table == tab &&
                    (sc = sizeCtl) < 0) {
+                //条件一：(sc >>> RESIZE_STAMP_SHIFT) != rs
+                //      true->说明当前线程获取到的扩容唯一标识戳 非 本批次扩容
+                //      false->说明当前线程获取到的扩容唯一标识戳 是 本批次扩容
+                //条件二： JDK1.8 中有bug jira已经提出来了 其实想表达的是 =  sc == (rs << 16 ) + 1
+                //        true-> 表示扩容完毕，当前线程不需要再参与进来了
+                //        false->扩容还在进行中，当前线程可以参与
+                //条件三：JDK1.8 中有bug jira已经提出来了 其实想表达的是 = sc == (rs<<16) + MAX_RESIZERS
+                //        true-> 表示当前参与并发扩容的线程达到了最大值 65535 - 1
+                //        false->表示当前线程可以参与进来
+                //条件四：transferIndex <= 0
+                //      true->说明map对象全局范围内的任务已经分配完了，当前线程进去也没活干..
+                //      false->还有任务可以分配。
                 if ((sc >>> RESIZE_STAMP_SHIFT) != rs || sc == rs + 1 ||
                     sc == rs + MAX_RESIZERS || transferIndex <= 0)
                     break;
@@ -2821,6 +2851,7 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
                     advance = false;
                 }
             }
+            //CASE1：
             //条件一：i < 0
             //成立：表示当前线程未分配到任务
             if (i < 0 || i >= n || i + n >= nextn) {
@@ -2832,22 +2863,41 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
                     sizeCtl = (n << 1) - (n >>> 1);
                     return;
                 }
+                //条件成立：说明设置sizeCtl 低16位  -1 成功，当前线程可以正常退出
                 if (U.compareAndSwapInt(this, SIZECTL, sc = sizeCtl, sc - 1)) {
+                    //1000 0000 0001 1011 0000 0000 0000 0000
+                    //条件成立：说明当前线程不是最后一个退出transfer任务的线程
                     if ((sc - 2) != resizeStamp(n) << RESIZE_STAMP_SHIFT)
+                        //正常退出
                         return;
                     finishing = advance = true;
                     i = n; // recheck before commit
                 }
             }
+            //前置条件：【CASE2~CASE4】 当前线程任务尚未处理完，正在进行中
+
+            //CASE2:
+            //条件成立：说明当前桶位未存放数据，只需要将此处设置为fwd节点即可。
             else if ((f = tabAt(tab, i)) == null)
                 advance = casTabAt(tab, i, null, fwd);
+            //CASE3:
+            //条件成立：说明当前桶位已经迁移过了，当前线程不用再处理了，直接再次更新当前线程任务索引，再次处理下一个桶位 或者 其它操作
             else if ((fh = f.hash) == MOVED)
                 advance = true; // already processed
+            //CASE4:
+            //前置条件：当前桶位有数据，而且node节点 不是 fwd节点，说明这些数据需要迁移。
             else {
+                //sync 加锁当前桶位的头结点
                 synchronized (f) {
+                    //防止在你加锁头对象之前，当前桶位的头对象被其它写线程修改过，导致你目前加锁对象错误...
                     if (tabAt(tab, i) == f) {
+                        //ln 表示低位链表引用
+                        //hn 表示高位链表引用
                         Node<K,V> ln, hn;
+                        //条件成立：表示当前桶位是链表桶位
                         if (fh >= 0) {
+                            //lastRun
+                            //可以获取出 当前链表 末尾连续高位不变的 node
                             int runBit = fh & n;
                             Node<K,V> lastRun = f;
                             for (Node<K,V> p = f.next; p != null; p = p.next) {
@@ -2857,10 +2907,12 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
                                     lastRun = p;
                                 }
                             }
+                            //条件成立：说明lastRun引用的链表为 低位链表，那么就让 ln 指向 低位链表
                             if (runBit == 0) {
                                 ln = lastRun;
                                 hn = null;
                             }
+                            //否则，说明lastRun引用的链表为 高位链表，就让 hn 指向 高位链表
                             else {
                                 hn = lastRun;
                                 ln = null;
@@ -2877,23 +2929,37 @@ public class ConcurrentHashMap<K,V> extends AbstractMap<K,V>
                             setTabAt(tab, i, fwd);
                             advance = true;
                         }
+                        //条件成立：表示当前桶位是 红黑树 代理结点TreeBin
                         else if (f instanceof TreeBin) {
+                            //转换头结点为 treeBin引用 t
                             TreeBin<K,V> t = (TreeBin<K,V>)f;
+                            //低位双向链表 lo 指向低位链表的头  loTail 指向低位链表的尾巴
                             TreeNode<K,V> lo = null, loTail = null;
+                            //高位双向链表 lo 指向高位链表的头  loTail 指向高位链表的尾巴
                             TreeNode<K,V> hi = null, hiTail = null;
+                            //lc 表示低位链表元素数量
+                            //hc 表示高位链表元素数量
                             int lc = 0, hc = 0;
+                            //迭代TreeBin中的双向链表，从头结点 至 尾节点
                             for (Node<K,V> e = t.first; e != null; e = e.next) {
+                                // h 表示循环处理当前元素的 hash
                                 int h = e.hash;
+                                //使用当前节点 构建出来的 新的 TreeNode
                                 TreeNode<K,V> p = new TreeNode<K,V>
                                     (h, e.key, e.val, null, null);
+                                //条件成立：表示当前循环节点 属于低位链 节点
                                 if ((h & n) == 0) {
+                                    //条件成立：说明当前低位链表 还没有数据
                                     if ((p.prev = loTail) == null)
                                         lo = p;
+                                    //说明 低位链表已经有数据了，此时当前元素 追加到 低位链表的末尾就行了
                                     else
                                         loTail.next = p;
+                                    //将低位链表尾指针指向 p 节点
                                     loTail = p;
                                     ++lc;
                                 }
+                                //当前节点 属于 高位链 节点
                                 else {
                                     if ((p.prev = hiTail) == null)
                                         hi = p;
